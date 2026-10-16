@@ -1,0 +1,465 @@
+name: build-scan-sign
+
+# =============================================================================
+# LAYER 1 — provenance. Everything downstream depends on what happens here.
+#
+# The pipeline does five things in a fixed order, and the order is the design:
+#
+#   1. build and push, capturing the DIGEST the registry returned
+#   2. generate an SBOM of what was actually pushed
+#   3. scan it, and fail the build on fixable HIGH/CRITICAL findings
+#   4. sign the DIGEST, keylessly, with this workflow's OIDC identity
+#   5. attach the SBOM as a signed attestation
+#
+# Only after all five does the GitOps repo learn the digest exists. A signature
+# produced before the scan would mean "this was built here", which is a weaker
+# claim than "this was built here and passed the gate".
+#
+# CI STILL HAS NO CLUSTER CREDENTIALS. That was the security argument for two
+# repositories in the previous project and it holds harder here: this pipeline
+# can publish an image and move a digest in git, and it cannot reach the
+# cluster, because nothing in it holds a kubeconfig.
+# =============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - "web/**"
+      - ".github/workflows/build-sign.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  # ---------------------------------------------------------------------------
+  # THE LINE THAT MAKES KEYLESS SIGNING POSSIBLE, and the one most often missing.
+  #
+  # id-token: write lets the job request a short-lived OIDC token from GitHub.
+  # Cosign exchanges that token with Fulcio for a code-signing certificate whose
+  # subject is this workflow's identity:
+  #
+  #   https://github.com/Syed-Amjad/supply-chain-app/.github/workflows/build-sign.yml@refs/heads/main
+  #
+  # There is no private key anywhere in this repository or in its secrets. The
+  # certificate lives for ten minutes and the signature outlives it, verifiable
+  # against the Rekor transparency log.
+  #
+  # Without this permission cosign fails with:
+  #
+  #   Error: getting key from Fulcio: retrieving ambient OIDC credentials:
+  #   fetching Actions OIDC token: unable to get ACTIONS_ID_TOKEN_REQUEST_URL
+  #
+  # which names an environment variable rather than a permission, and sends you
+  # looking in the wrong place.
+  # ---------------------------------------------------------------------------
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      # fail-fast off: if api has a vulnerable dependency and web does not, you
+      # want to know both results in one run rather than discover the second
+      # one tomorrow.
+      fail-fast: false
+      matrix:
+        service: [api, web]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # LIMITATION, STATED RATHER THAN HIDDEN.
+      #
+      # These actions are pinned to major-version tags, which are MUTABLE. In a
+      # supply-chain project the honest statement is that the real answer is a
+      # full commit SHA:
+      #
+      #   - uses: actions/checkout@b4ffde6...   # v4.2.2
+      #
+      # because a tag can be moved to point at different code by anyone who can
+      # push to that repository, which is precisely the attack this project is
+      # about. Resolve them with:
+      #
+      #   gh api repos/actions/checkout/commits/v4 --jq .sha
+      #
+      # Tags are used here so the pipeline is readable and so a reader can see
+      # what each step is. That trade-off is recorded in
+      # docs/ATTACK-RESULTS.md under limitations, not quietly taken.
+      # ---------------------------------------------------------------------
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------------
+      # Docker repository names must be lowercase and buildx REFUSES rather
+      # than normalising:
+      #
+      #   ERROR: failed to build: invalid tag "ghcr.io/Syed-Amjad/zt-api:...":
+      #   repository name must be lowercase
+      #
+      # github.repository_owner returns `Syed-Amjad`. GitHub Actions
+      # expressions have no lowercase function, so it is done in bash.
+      # The manifests in zerotrust-gitops/workloads/ and the Kyverno image
+      # allowlist both hardcode `ghcr.io/syed-amjad/...`, and all three
+      # spellings have to agree.
+      # ---------------------------------------------------------------------
+      - name: Lowercase the registry owner
+        id: repo
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          # A SHA tag for humans reading the registry, but the tag is not what
+          # gets deployed or signed — see the digest output below.
+          tags: ghcr.io/${{ steps.repo.outputs.owner }}/zt-${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          # ---------------------------------------------------------------
+          # provenance: false is deliberate and it is NOT a weakening.
+          #
+          # buildx defaults to attaching a SLSA provenance attestation, which
+          # turns the pushed artifact into an OCI image INDEX with two
+          # manifests: the image, and the attestation. cosign then signs the
+          # index digest, and Kyverno — resolving the same tag — can end up
+          # verifying a different digest than the one the kubelet runs, or
+          # reject the image because the signature is on the index rather than
+          # the manifest. The symptom is a signature that verifies by hand with
+          # `cosign verify` and is still refused at admission, which is a very
+          # long evening.
+          #
+          # Provenance is not lost: cosign's own signature plus the SBOM
+          # attestation below carry it, bound to the same OIDC identity.
+          # ---------------------------------------------------------------
+
+      # =====================================================================
+      # From here on, everything addresses the image by DIGEST.
+      #
+      # build-push-action reports the digest the registry computed, which is
+      # the only unambiguous name the artifact has. A tag is a mutable pointer:
+      # whoever can push to the registry can move `:v1` to different bytes
+      # after you scanned it. Signing a tag means signing a promise that
+      # somebody else is allowed to break.
+      # =====================================================================
+      - name: Pin the digest for the rest of the job
+        id: pin
+        env:
+          OWNER: ${{ steps.repo.outputs.owner }}
+          SVC: ${{ matrix.service }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Guard, not decoration. If the digest output were ever empty, every
+          # step below would silently operate on "ghcr.io/owner/zt-api@" and
+          # the failures would be unrecognisable.
+          [[ -n "${DIGEST}" ]] || { echo "::error::build produced no digest"; exit 1; }
+          echo "ref=ghcr.io/${OWNER}/zt-${SVC}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pinned: ghcr.io/${OWNER}/zt-${SVC}@${DIGEST}"
+
+      # ---------------------------------------------------------------------
+      # Scanners are installed from their official installers and deliberately
+      # NOT pinned, which looks inconsistent with the note about action tags
+      # above. It is not.
+      #
+      # Pinning matters for anything that changes the ARTIFACT. A scanner does
+      # not change the artifact; it changes what you know about it, and what
+      # you want to know is today's vulnerability data, not the data from
+      # whenever the pipeline was written. The same reasoning is why the Trivy
+      # DB is refreshed on every run rather than cached.
+      # ---------------------------------------------------------------------
+      - name: Install syft and trivy
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          syft version
+          trivy --version
+
+      - name: Generate the SBOM
+        env:
+          REF: ${{ steps.pin.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # SPDX JSON rather than Syft's native format: it is an ISO standard,
+          # cosign has a predicate type for it, and anything that consumes
+          # SBOMs can read it.
+          #
+          # The SBOM is generated from the PUSHED image, by digest, not from
+          # the local build context. Those can differ — a .dockerignore
+          # mistake, a multi-stage copy that misses a layer — and an SBOM of
+          # something other than the artifact you shipped is worse than none,
+          # because it is believed.
+          syft "${REF}" -o spdx-json > sbom.spdx.json
+          echo "SBOM packages: $(jq '.packages | length' sbom.spdx.json)"
+
+      - name: Scan, and fail the build on fixable HIGH or CRITICAL
+        env:
+          REF: ${{ steps.pin.outputs.ref }}
+        run: |
+          set -euo pipefail
+
+          # -----------------------------------------------------------------
+          # --ignore-unfixed IS THE WHOLE POLICY DECISION IN THIS STEP, and it
+          # is the one a reviewer should ask about.
+          #
+          # Without it this build does not pass. python:3.12-slim is a current,
+          # well-maintained base image and it still carries HIGH and CRITICAL
+          # CVEs in Debian packages for which no fixed version has been
+          # published. A gate that fails on those fails every build, every day,
+          # for something no change to this repository can fix.
+          #
+          # What happens next is the real failure mode, and it is social rather
+          # than technical: the gate gets switched off, or it gets a blanket
+          # `|| true`, and then it is not catching the fixable ones either. A
+          # gate nobody can satisfy is a gate nobody keeps.
+          #
+          # So the policy is: fail on anything with a fix available, report
+          # everything else. "Fixable" is a property the team can act on.
+          # Unfixed findings are still printed below, and in a real environment
+          # they belong in a review cadence with a documented acceptance —
+          # which is what .trivyignore is for, with dated entries.
+          # -----------------------------------------------------------------
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            --no-progress \
+            --format table \
+            "${REF}"
+
+          echo "::group::Unfixed HIGH/CRITICAL (reported, not gated)"
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            --no-progress \
+            --format table \
+            "${REF}" || true
+          echo "::endgroup::"
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          # Pinned because cosign's CLI surface and its default bundle format
+          # have both changed between minor versions, and the Kyverno policy on
+          # the cluster has to be able to read what this produces. If the
+          # install step ever fails on an unknown release, bump this — do not
+          # remove it.
+          cosign-release: v2.4.1
+
+      - name: Sign the digest, keylessly
+        env:
+          REF: ${{ steps.pin.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # --yes skips the "this will be public" confirmation. It IS public:
+          # the signature and the certificate go into Rekor, a public
+          # append-only log, and the repository name and workflow path are
+          # visible in the certificate. That is the trade for not holding a key.
+          # Private repositories should use a private Rekor or keyed signing.
+          cosign sign --yes "${REF}"
+
+      - name: Attach the SBOM as a signed attestation
+        env:
+          REF: ${{ steps.pin.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # An attestation is a signed statement ABOUT the image rather than a
+          # signature OF it. The distinction matters because it means the SBOM
+          # cannot be swapped: it is bound to this digest and to the same OIDC
+          # identity that signed the image.
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${REF}"
+
+      - name: Verify what was just published, from scratch
+        env:
+          REF: ${{ steps.pin.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # -----------------------------------------------------------------
+          # Verifying inside the job that produced the signature looks
+          # circular. It is not: it exercises the same identity match the
+          # cluster will apply, and it fails HERE, in a run you are already
+          # watching, rather than at admission half an hour later as an
+          # unexplained ImagePullBackOff-shaped rejection.
+          #
+          # The two flags are the policy. The subject is this exact workflow
+          # file on this exact branch of this exact repository; the issuer is
+          # GitHub's OIDC provider. Anyone who steals registry credentials can
+          # push an image. They cannot produce a Fulcio certificate naming this
+          # workflow without also controlling this repository.
+          # -----------------------------------------------------------------
+          cosign verify \
+            --certificate-identity-regexp \
+              "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/build-sign\.yml@refs/heads/main$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${REF}" | tee verify.txt
+
+          cosign verify-attestation \
+            --type spdxjson \
+            --certificate-identity-regexp \
+              "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/build-sign\.yml@refs/heads/main$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${REF}" > /dev/null
+          echo "signature and SBOM attestation both verify"
+
+      - name: Hand the digest to the bump job
+        env:
+          DIGEST: ${{ steps.pin.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          echo "${DIGEST}" > "out/${{ matrix.service }}.digest"
+
+      # Matrix legs cannot write to a shared job output, so the digests travel
+      # as artifacts. One artifact per leg, collected by name in bump-gitops.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.service }}
+          path: out/${{ matrix.service }}.digest
+          retention-days: 1
+
+  # ===========================================================================
+  # THE NEGATIVE CONTROL.
+  #
+  # Attack 1 asserts that an unsigned image is rejected at admission. That
+  # assertion is worthless without an unsigned image that is otherwise
+  # identical in every respect that matters: same registry, same owner, same
+  # base, same build pipeline, matched by the same Kyverno imageReferences
+  # glob. Reaching for `nginx:latest` instead would test the registry
+  # allowlist, not the signature check — a different policy, passing for the
+  # wrong reason.
+  #
+  # So this job publishes one deliberately unsigned image. It is a test
+  # fixture, it is labelled as one in the image itself, and it is the reason
+  # attack 1 proves anything.
+  #
+  # It runs on every push rather than once, so the control sample can never be
+  # staler than the thing it is a control for.
+  # ===========================================================================
+  publish-unsigned-control:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # No id-token here. Not an oversight — this job must not be ABLE to sign.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase the registry owner
+        id: repo
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build an unsigned, clearly-labelled control image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          push: true
+          tags: ghcr.io/${{ steps.repo.outputs.owner }}/zt-unsigned-control:latest
+          provenance: false
+          # The label guarantees a different digest from the signed api image.
+          # Without it the two could share bytes, and the test would still pass
+          # — a cosign signature lives in the repository alongside the image as
+          # a `sha256-<hex>.sig` tag, so identical bytes in a different
+          # repository are still unsigned — but a reader would reasonably
+          # wonder, and a test that needs explaining is a weak test.
+          labels: |
+            org.opencontainers.image.description=DELIBERATELY UNSIGNED test fixture for attack-01. Not for use.
+
+  # ===========================================================================
+  # Write the verified digests into the GitOps repo. This is the only way CI
+  # influences the cluster, and it influences it by committing to git.
+  # ===========================================================================
+  bump-gitops:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+
+      - name: Update the image digests in the GitOps repo
+        env:
+          # A fine-grained PAT with contents:write on zerotrust-gitops ONLY.
+          # GITHUB_TOKEN cannot reach another repository, which is the point:
+          # this pipeline is scoped to exactly one external write.
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          GITOPS_REPO: ${{ vars.GITOPS_REPO }} # Syed-Amjad/zerotrust-gitops
+          OWNER_LC: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          OWNER_LC="${OWNER_LC,,}"
+
+          API_DIGEST="$(cat digests/api.digest)"
+          WEB_DIGEST="$(cat digests/web.digest)"
+
+          # Shape check before touching anything. A malformed digest written
+          # into a manifest produces an admission rejection that reads like a
+          # policy problem.
+          for d in "$API_DIGEST" "$WEB_DIGEST"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest: $d"; exit 1; }
+          done
+
+          git clone --depth 1 \
+            "https://x-access-token:${GITOPS_TOKEN}@github.com/${GITOPS_REPO}.git" gitops
+          cd gitops
+
+          # -----------------------------------------------------------------
+          # The manifests reference images BY DIGEST, so this rewrites the part
+          # after the `@` and never introduces a tag.
+          #
+          # That is not a style preference. Kyverno verifies the signature for
+          # the digest it resolves at admission time. If the manifest carried a
+          # mutable tag, the digest Kyverno verified and the digest the kubelet
+          # later pulled could differ — the gap a registry compromise lives in.
+          # Writing the digest into git closes it, and makes the deployed
+          # artifact a reviewable line in a diff.
+          # -----------------------------------------------------------------
+          sed -i -E "s|(image: ghcr\.io/${OWNER_LC}/zt-api@)sha256:[0-9a-f]{64}|\1${API_DIGEST}|" \
+            workloads/api.yaml
+          sed -i -E "s|(image: ghcr\.io/${OWNER_LC}/zt-web@)sha256:[0-9a-f]{64}|\1${WEB_DIGEST}|" \
+            workloads/web.yaml
+
+          # set -e would NOT catch a sed that matched nothing: sed exits 0 when
+          # the pattern is absent. The previous project lost an evening to
+          # exactly this class of silent no-op, so the result is asserted.
+          grep -q "zt-api@${API_DIGEST}" workloads/api.yaml \
+            || { echo "::error::api digest did not land - check the image path spelling"; exit 1; }
+          grep -q "zt-web@${WEB_DIGEST}" workloads/web.yaml \
+            || { echo "::error::web digest did not land - check the image path spelling"; exit 1; }
+
+          if git diff --quiet; then
+            echo "Digests unchanged - nothing to commit."
+            exit 0
+          fi
+
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git commit -am "chore: publish verified digests for ${GITHUB_SHA}"
+          git push
+          echo "Pushed. ArgoCD will sync, and Kyverno will verify the signature at admission."

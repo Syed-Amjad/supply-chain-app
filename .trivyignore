@@ -1,0 +1,20 @@
+# Accepted vulnerability findings, with a reason and a review date.
+#
+# EMPTY ON PURPOSE, and the format below is the point of the file.
+#
+# The scan gate in .github/workflows/build-sign.yml fails only on findings that
+# have a FIX AVAILABLE. That removes the usual reason this file fills up with
+# undated entries — an unfixed CVE in a base image does not need suppressing
+# because it was never gating.
+#
+# When a fixable finding genuinely cannot be fixed yet, it belongs here WITH a
+# reason and a date, in this shape:
+#
+#   # CVE-2025-00000 — urllib3. Fix needs httpx 0.29, which drops the API used
+#   # in web/main.py. Not reachable: the endpoint does not parse redirects.
+#   # Accepted 2026-10-20, review by 2026-11-20.
+#   CVE-2025-00000
+#
+# A bare CVE id on its own line silences the finding permanently and tells the
+# next reader nothing about whether it still applies. That is how a scanner
+# stops being useful.

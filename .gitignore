@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Build and scan artefacts — generated per run, never committed.
+sbom.spdx.json
+verify.txt
+out/
