@@ -1,3 +1,25 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
+# ---------------------------------------------------------------------------
+# 2026-10-16 — bumped because the Trivy gate failed the build, which is the
+# gate working rather than a gate to argue with. See api/requirements.txt for
+# the full reasoning; the short version:
+#
+# fastapi 0.115.6 pinned starlette <0.42.0, so the image shipped starlette
+# 0.41.3 with three HIGH CVEs that all had a published fix:
+#
+#   CVE-2025-62727  DoS via Range header merging                fixed 0.49.1
+#   CVE-2026-48818  SSRF + NTLM credential theft via UNC paths  fixed 1.1.0
+#   CVE-2026-54283  form() limits ignored -> DoS                fixed 1.3.1
+#
+# CVE-2026-48818 is worth noticing on THIS service in particular: `web` already
+# ships a deliberate SSRF at /fetch, which exists to prove the egress allowlist
+# holds. A second SSRF that nobody chose is a different thing entirely — the
+# demonstration depends on /fetch being the only one.
+#
+# starlette is pinned explicitly rather than left to fastapi's `>=0.46.0`
+# floor, so the fix is auditable and the resolution is reproducible.
+# httpx 0.28.1 is unchanged: it is already the current release.
+# ---------------------------------------------------------------------------
+fastapi==0.143.2
+starlette==1.8.0
+uvicorn[standard]==0.54.0
 httpx==0.28.1

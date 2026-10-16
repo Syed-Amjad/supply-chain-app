@@ -1,2 +1,30 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
+# ---------------------------------------------------------------------------
+# 2026-10-16 — bumped because the Trivy gate failed the build, which is the
+# gate working rather than a gate to argue with.
+#
+# fastapi 0.115.6 pinned starlette to >=0.40.0,<0.42.0, so the image shipped
+# starlette 0.41.3 and carried three HIGH CVEs that all had a fix published:
+#
+#   CVE-2025-62727  DoS via Range header merging                fixed 0.49.1
+#   CVE-2026-48818  SSRF + NTLM credential theft via UNC paths  fixed 1.1.0
+#   CVE-2026-54283  form() limits ignored -> DoS                fixed 1.3.1
+#
+# "Fixable" is exactly the property --ignore-unfixed does not suppress, so
+# these three were the gate doing the one job it is kept for. The Debian layer
+# scanned clean (0 findings); every finding was in a Python package.
+#
+# starlette is named HERE, explicitly, even though it arrives transitively.
+# fastapi 0.143.2 asks only for `starlette>=0.46.0` — a floor is not a pin, and
+# an unpinned floor means this image resolves differently next month without
+# anything in git changing. Naming it makes the CVE fix auditable, and if a
+# future fastapi ever needs a starlette this pin forbids, pip fails loudly at
+# build time instead of resolving to something nobody chose.
+#
+# starlette 0.41 -> 1.8 crosses a major version, so it was not assumed: both
+# services were run against this exact set and every endpoint exercised,
+# including the second hop, the x-canary header forwarding and the
+# X-Forwarded-Client-Cert SPIFFE parsing.
+# ---------------------------------------------------------------------------
+fastapi==0.143.2
+starlette==1.8.0
+uvicorn[standard]==0.54.0
